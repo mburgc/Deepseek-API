@@ -52,7 +52,7 @@ from .config import (
     UPSTREAM_SERIALIZE,
     resolve_model,
 )
-from .content import as_message_dicts, canonical_hash, file_parts, image_parts, text_of
+from .content import as_message_dicts, file_parts, image_parts, text_of
 from .openai_format import (
     Answer,
     collect_answer,
@@ -66,7 +66,7 @@ from .openai_format import (
 )
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
-from .threads import ThreadStore
+from .threads import ThreadStore, message_hash
 from .toolbridge import tool_choice_mode
 
 load_dotenv()
@@ -309,6 +309,7 @@ def _thread_key(messages: List[Dict], model_id: str, thinking: bool, search: boo
     blob = json.dumps(
         {
             "system": extract_system(messages),
+            "anchor": _thread_anchor(messages),
             "model": model_id,
             "thinking": thinking,
             "search": search,
@@ -325,23 +326,19 @@ def _profile_hash(messages: List[Dict]) -> str:
 
 
 def _thread_anchor(messages: List[Dict]) -> str:
-    """Conversation identity: the first two non-system messages.
+    """Conversation identity: the first user message.
 
-    Using only the first message made two unrelated sessions that opened with
-    the same greeting (or the same bootstrap prompt) share a thread.  Two
-    messages make that collision much less likely while still surviving a
-    system-prompt or tool-set change.
+    Stable across turns (the first message does not change while the thread
+    grows), and included in ``_thread_key`` so two conversations that share
+    model/tools/system cannot overwrite each other's row.
     """
-    picked = []
     for message in messages:
-        if (message.get("role") or "") in ("system", "developer"):
-            continue
-        picked.append(message)
-        if len(picked) == 2:
-            break
-    if not picked:
-        return ""
-    return canonical_hash(picked)[:32]
+        if (message.get("role") or "") == "user":
+            return message_hash(message)[:32]
+    for message in messages:
+        if (message.get("role") or "") not in ("system", "developer"):
+            return message_hash(message)[:32]
+    return ""
 
 
 _EDIT_RE = re.compile(r"^@edit(?:\s+(\d+))?(?:\s+([\s\S]+))?$", re.IGNORECASE)

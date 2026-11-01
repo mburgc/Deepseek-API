@@ -134,26 +134,60 @@ def test_anchor_fallback_is_rejected_when_profiles_differ(tmp_path):
     assert plan.mode == "new"
 
 
-def test_thread_anchor_uses_the_first_two_messages():
+def test_thread_anchor_is_stable_across_turns():
     from server.api import _thread_anchor
 
-    one = _thread_anchor([{"role": "user", "content": "hola"}])
-    two = _thread_anchor(
+    first = _thread_anchor([{"role": "user", "content": "hola"}])
+    second = _thread_anchor(
         [
             {"role": "user", "content": "hola"},
             {"role": "assistant", "content": "buenas"},
         ]
     )
-    two_with_system = _thread_anchor(
-        [
-            {"role": "system", "content": "sos un asistente"},
-            {"role": "user", "content": "hola"},
-            {"role": "assistant", "content": "buenas"},
-        ]
+    other = _thread_anchor([{"role": "user", "content": "otra conversacion"}])
+
+    assert first == second
+    assert first != other
+
+
+def test_key_separates_conversations_with_the_same_model_and_tools(tmp_path):
+    from server.api import _thread_anchor, _thread_key
+
+    store = make(tmp_path)
+    a = turn("proyecto A", "ok")
+    b = turn("proyecto B", "ok")
+    key_a = _thread_key(a, "deepseek-expert", False, False, [])
+    key_b = _thread_key(b, "deepseek-expert", False, False, [])
+
+    assert key_a != key_b
+
+    anchor_a = _thread_anchor(a)
+    anchor_b = _thread_anchor(b)
+    store.save(
+        key=key_a,
+        session_id="sess-a",
+        last_message_id=2,
+        messages_seen=a,
+        model_id="deepseek-expert",
+        anchor=anchor_a,
+    )
+    store.save(
+        key=key_b,
+        session_id="sess-b",
+        last_message_id=2,
+        messages_seen=b,
+        model_id="deepseek-expert",
+        anchor=anchor_b,
     )
 
-    assert one != two
-    assert two == two_with_system
+    plan = store.plan(
+        key_a,
+        a + [{"role": "tool", "content": "resultado"}],
+        anchor_a,
+    )
+
+    assert plan.mode == "append"
+    assert plan.thread.session_id == "sess-a"
 
 
 def test_edit_marker_truncates_and_appends_the_instruction():
