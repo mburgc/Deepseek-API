@@ -50,17 +50,27 @@ class RateLimiter:
             return True, self.limit - len(q), 0.0
 
 
-def install_rate_limit(app, limiter: RateLimiter, *, protect_prefix: str = "/v1") -> None:
+def install_rate_limit(
+    app,
+    limiter: RateLimiter,
+    *,
+    protect_prefix: str = "/v1",
+    exempt_localhost: bool = False,
+) -> None:
     """Attach `limiter` to a FastAPI/Starlette app as HTTP middleware.
 
     Only paths under `protect_prefix` are limited (so /healthz stays open). On
     every response we set the standard `X-RateLimit-*` headers; over-limit
     requests get a 429 with `Retry-After` and an OpenAI-shaped error body.
+    `exempt_localhost` skips limiting for loopback clients, which is what a
+    local coding agent needs (it fires many requests per task).
     """
 
     @app.middleware("http")
     async def _rate_limit(request: Request, call_next):
         if not request.url.path.startswith(protect_prefix):
+            return await call_next(request)
+        if exempt_localhost and _is_localhost(request):
             return await call_next(request)
 
         key = _client_key(request)
@@ -97,3 +107,7 @@ def _client_key(request: Request) -> str:
     if fwd:
         return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+def _is_localhost(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    return host in ("127.0.0.1", "::1", "localhost", "testclient")

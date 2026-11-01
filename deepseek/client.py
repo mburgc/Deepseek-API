@@ -1,5 +1,4 @@
-"""
-Pure-HTTP DeepSeek chat client.
+"""Pure-HTTP DeepSeek chat client.
 
 Speaks chat.deepseek.com's internal API directly using a captured signed-in
 session (see `deepseek.auth`). For each message it:
@@ -8,40 +7,56 @@ session (see `deepseek.auth`). For each message it:
     2. fetches a PoW challenge   (POST /api/v0/chat/create_pow_challenge)
     3. solves it via the WASM    (deepseek.pow.DeepSeekPow)
     4. POSTs the completion       with the x-ds-pow-response header
-    5. parses the SSE stream      into text
+    5. parses the SSE stream      into typed events (deepseek.sse)
 
-    from deepseek.auth import get_session
-    from deepseek.client import DeepSeekClient
+Two levels of API are exposed:
 
-    client = DeepSeekClient(get_session())
-    print(client.chat("Hello!"))                 # full reply
-    for chunk in client.stream("Tell a joke"):   # streamed
-        print(chunk, end="", flush=True)
+* ``client.request(...)`` returns a `CompletionStream` that yields typed events
+  (text, reasoning, search sources, status). Use it from the server bridge.
+* ``client.chat(...)`` / ``client.stream(...)`` are the simple helpers that only
+  return the answer text (kept for backwards compatibility).
 """
 
 from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass
-from typing import Iterator, Optional
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
 from .auth import Session, get_session
+from .events import ReasoningDelta, StreamState, TextDelta
 from .pow import DeepSeekPow
+from .sse import iter_events
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
+UPLOAD_PATH = "/api/v0/file/upload_file"
 
-# DeepSeek's mode pill, sent as `model_type` in the completion body. "default" is
-# Instant (the fast model); "expert" is the stronger, slower model. Omitting the
-# field lets the backend pick, so we always send one explicitly.
 DEFAULT_MODEL_TYPE = "default"
 
-# A conversation_id is an opaque "<chat_session_id>:<last_message_id>" token. It
-# carries everything needed to resume a thread, so the client stays stateless.
 _CID_SEP = ":"
+
+
+class DeepSeekAPIError(RuntimeError):
+    """An API-level failure returned inside an HTTP 200 envelope.
+
+    DeepSeek answers 200 with ``{"code":...,"data":{"biz_code":...,"biz_msg":...}}``
+    even for errors, so HTTP status alone is not enough to detect failure.
+    """
+
+    def __init__(self, message: str, *, code=None, biz_code=None, status=None):
+        super().__init__(message)
+        self.code = code
+        self.biz_code = biz_code
+        self.status = status
+
+    @property
+    def is_rate_limit(self) -> bool:
+        return self.code == 429 or self.biz_code in (7, 429)
 
 
 def _encode_cid(session_id: str, message_id: Optional[int]) -> str:
@@ -50,7 +65,7 @@ def _encode_cid(session_id: str, message_id: Optional[int]) -> str:
     return f"{session_id}{_CID_SEP}{message_id}"
 
 
-def _decode_cid(conversation_id: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+def _decode_cid(conversation_id: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
     """Split a conversation_id back into (chat_session_id, parent_message_id)."""
     if not conversation_id:
         return None, None
@@ -65,18 +80,35 @@ class Reply:
 
     text: str
     conversation_id: str
+    reasoning: str = ""
+    search_results: List[Dict] = field(default_factory=list)
+    token_usage: Optional[int] = None
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
 
 
-def _biz(data: dict) -> dict:
+def _unwrap(data: dict, status: Optional[int] = None) -> dict:
     """Unwrap DeepSeek's `data.biz_data` envelope, raising on API-level errors."""
+    if not isinstance(data, dict):
+        raise DeepSeekAPIError(f"Unexpected response: {data!r}", status=status)
     if data.get("code") != 0:
-        raise RuntimeError(f"DeepSeek API error: {data.get('msg') or data}")
-    biz = data.get("data", {}).get("biz_data")
+        raise DeepSeekAPIError(
+            f"DeepSeek API error: {data.get('msg') or data}",
+            code=data.get("code"),
+            status=status,
+        )
+    payload = data.get("data") or {}
+    if payload.get("biz_code") not in (0, None):
+        raise DeepSeekAPIError(
+            f"DeepSeek error {payload.get('biz_code')}: {payload.get('biz_msg')}",
+            code=data.get("code"),
+            biz_code=payload.get("biz_code"),
+            status=status,
+        )
+    biz = payload.get("biz_data")
     if biz is None:
-        raise RuntimeError(f"Unexpected response shape: {data}")
+        raise DeepSeekAPIError(f"Unexpected response shape: {data}", status=status)
     return biz
 
 
@@ -85,16 +117,15 @@ class DeepSeekClient:
         self,
         session: Optional[Session] = None,
         allow_interactive: bool = True,
+        http: Optional[httpx.Client] = None,
     ):
-        # `allow_interactive=False` makes session resolution non-blocking: it
-        # uses a cached/headless session and raises LoginRequired instead of
-        # opening a browser window. The server passes False (see server/api.py).
         self.session = session or get_session(allow_interactive=allow_interactive)
         self._pow = DeepSeekPow()
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
-        # access so concurrent server requests don't corrupt it.
+        # access so concurrent requests don't corrupt it.
         self._pow_lock = threading.Lock()
-        self._http = httpx.Client(
+        self._owns_http = http is None
+        self._http = http or httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
             cookies=self.session.cookies,
@@ -105,7 +136,6 @@ class DeepSeekClient:
         return {
             "authorization": f"Bearer {self.session.token}",
             "accept": "*/*",
-            "content-type": "application/json",
             "user-agent": self.session.user_agent,
             "origin": BASE,
             "referer": f"{BASE}/",
@@ -122,18 +152,102 @@ class DeepSeekClient:
     def create_chat_session(self) -> str:
         r = self._http.post("/api/v0/chat_session/create", json={})
         r.raise_for_status()
-        return _biz(r.json())["chat_session"]["id"]
+        return _unwrap(r.json(), r.status_code)["chat_session"]["id"]
+
+    def pow_header(self, target_path: str = COMPLETION_PATH) -> str:
+        """Fetch a challenge and solve it. Retries once if the challenge expired."""
+        last_error: Optional[Exception] = None
+        for _ in range(2):
+            r = self._http.post(
+                "/api/v0/chat/create_pow_challenge",
+                json={"target_path": target_path},
+            )
+            r.raise_for_status()
+            challenge = _unwrap(r.json(), r.status_code)["challenge"]
+            with self._pow_lock:
+                try:
+                    return self._pow.make_header(challenge)
+                except RuntimeError as e:
+                    last_error = e
+        raise DeepSeekAPIError(f"Could not solve proof-of-work: {last_error}")
 
     def _pow_header(self, target_path: str = COMPLETION_PATH) -> str:
-        r = self._http.post(
-            "/api/v0/chat/create_pow_challenge", json={"target_path": target_path}
+        return self.pow_header(target_path)
+
+    # --- account helpers ----------------------------------------------------
+
+    def current_user(self) -> Dict:
+        r = self._http.get("/api/v0/users/current")
+        r.raise_for_status()
+        return _unwrap(r.json(), r.status_code)
+
+    def client_settings(self, device_id: str = "bridge", os_name: str = "web") -> Dict:
+        r = self._http.get(
+            "/api/v0/client/settings", params={"did": device_id, "os": os_name}
         )
         r.raise_for_status()
-        challenge = _biz(r.json())["challenge"]
-        with self._pow_lock:
-            return self._pow.make_header(challenge)
+        return _unwrap(r.json(), r.status_code).get("settings") or {}
+
+    def list_sessions(self, count: int = 20) -> List[Dict]:
+        r = self._http.get("/api/v0/chat_session/fetch_page", params={"count": count})
+        r.raise_for_status()
+        return _unwrap(r.json(), r.status_code).get("chat_sessions") or []
+
+    def history(self, session_id: str, count: int = 100) -> Dict:
+        r = self._http.get(
+            "/api/v0/chat/history_messages",
+            params={"chat_session_id": session_id, "count": count},
+        )
+        r.raise_for_status()
+        return _unwrap(r.json(), r.status_code)
 
     # --- public API ---------------------------------------------------------
+
+    def request(
+        self,
+        prompt: str,
+        *,
+        session_id: Optional[str] = None,
+        parent_id: Optional[int] = None,
+        conversation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        thinking: bool = False,
+        search: bool = False,
+        ref_file_ids: Optional[List[str]] = None,
+        action=None,
+        preempt: bool = False,
+    ) -> "CompletionStream":
+        """Start a completion and return a stream of typed events.
+
+        A new thread is created when neither `session_id` nor `conversation_id`
+        is given; the selected `model` only applies to new threads (a thread's
+        model is fixed at creation).
+        """
+        if conversation_id and (session_id or model is not None):
+            raise ValueError(
+                "pass either conversation_id or session_id+model, not both"
+            )
+        if conversation_id:
+            session_id, parent_id = _decode_cid(conversation_id)
+
+        if session_id is None:
+            session_id = self.create_chat_session()
+            model_type: Optional[str] = model or DEFAULT_MODEL_TYPE
+        else:
+            model_type = None if parent_id is not None else (model or None)
+
+        return CompletionStream(
+            client=self,
+            prompt=prompt,
+            session_id=session_id,
+            parent_id=parent_id,
+            model_type=model_type,
+            thinking=thinking,
+            search=search,
+            ref_file_ids=ref_file_ids or [],
+            action=action,
+            preempt=preempt,
+        )
 
     def stream(
         self,
@@ -142,31 +256,20 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
-    ) -> "_Stream":
-        """Stream a reply. Iterate it for text chunks; read `.conversation_id`
-        afterwards to resume the thread. Pass an existing `conversation_id` to
-        continue a previous conversation.
+        ref_file_ids: Optional[List[str]] = None,
+    ) -> "CompletionStream":
+        """Stream a reply, yielding only the answer text chunks.
 
-        `model` is DeepSeek's model_type wire value: "default" (Instant) or
-        "expert"; it defaults to "default" on a NEW thread. It cannot be combined
-        with `conversation_id` — a thread's model is fixed when it's created, so
-        resuming keeps the original model. `thinking` enables DeepThink reasoning
-        and `search` enables web search; both are independent of the model.
+        Kept for backwards compatibility; use `request()` for typed events.
         """
-        if conversation_id and model is not None:
-            raise ValueError(
-                "`model` cannot be set together with `conversation_id`; a thread's "
-                "model is fixed when it is created. Pass `model` only on the first turn."
-            )
-        session_id, parent_id = _decode_cid(conversation_id)
-        if session_id is None:
-            # New thread: select the model (default when unspecified).
-            session_id = self.create_chat_session()
-            model_type: Optional[str] = model or DEFAULT_MODEL_TYPE
-        else:
-            # Resuming: let the existing thread's model stand (send no model_type).
-            model_type = None
-        return _Stream(self, prompt, session_id, parent_id, model_type, thinking, search)
+        return self.request(
+            prompt,
+            conversation_id=conversation_id,
+            model=model,
+            thinking=thinking,
+            search=search,
+            ref_file_ids=ref_file_ids,
+        )
 
     def chat(
         self,
@@ -175,129 +278,163 @@ class DeepSeekClient:
         model: Optional[str] = None,
         thinking: bool = False,
         search: bool = False,
+        ref_file_ids: Optional[List[str]] = None,
     ) -> Reply:
         """Return the complete reply (`.text`) plus its `.conversation_id`."""
-        s = self.stream(prompt, conversation_id=conversation_id,
-                        model=model, thinking=thinking, search=search)
-        text = "".join(s)
-        return Reply(text=text, conversation_id=s.conversation_id)
+        s = self.request(
+            prompt,
+            conversation_id=conversation_id,
+            model=model,
+            thinking=thinking,
+            search=search,
+            ref_file_ids=ref_file_ids,
+        )
+        parts: List[str] = []
+        reasoning: List[str] = []
+        for event in s:
+            if isinstance(event, TextDelta):
+                parts.append(event.text)
+            elif isinstance(event, ReasoningDelta):
+                reasoning.append(event.text)
+        return Reply(
+            text="".join(parts),
+            conversation_id=s.conversation_id,
+            reasoning="".join(reasoning),
+            search_results=s.state.sorted_results(),
+            token_usage=s.state.token_usage,
+        )
 
     def close(self) -> None:
-        self._http.close()
+        if self._owns_http:
+            self._http.close()
 
 
-class _Stream:
-    """Iterable of reply-text chunks. After it's consumed, `.conversation_id`
-    holds the token for resuming the conversation."""
+class CompletionStream:
+    """Iterable of typed events for one completion.
 
-    def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
-                 parent_id: Optional[int], model: str,
-                 thinking: bool, search: bool):
+    After consumption, `state` holds the assistant message id, real token usage
+    and search results, and `conversation_id` is the resumable token.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: DeepSeekClient,
+        prompt: str,
+        session_id: str,
+        parent_id: Optional[int],
+        model_type: Optional[str],
+        thinking: bool,
+        search: bool,
+        ref_file_ids: List[str],
+        action,
+        preempt: bool,
+    ):
         self._client = client
-        self._prompt = prompt
-        self._session_id = session_id
-        self._parent_id = parent_id
-        self._model = model
-        self._thinking = thinking
-        self._search = search
-        self._message_id: Optional[int] = None
+        self.prompt = prompt
+        self.session_id = session_id
+        self.parent_id = parent_id
+        self.model_type = model_type
+        self.thinking = thinking
+        self.search = search
+        self.ref_file_ids = ref_file_ids
+        self.action = action
+        self.preempt = preempt
+        self.state = StreamState()
+        self._consumed = False
 
-    def __iter__(self) -> Iterator[str]:
-        body = {
-            "chat_session_id": self._session_id,
-            "parent_message_id": self._parent_id,
-            "prompt": self._prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": self._thinking,
-            "search_enabled": self._search,
-            "action": None,
-            "preempt": False,
+    def body(self) -> Dict:
+        payload = {
+            "chat_session_id": self.session_id,
+            "parent_message_id": self.parent_id,
+            "prompt": self.prompt,
+            "ref_file_ids": list(self.ref_file_ids),
+            "thinking_enabled": self.thinking,
+            "search_enabled": self.search,
+            "action": self.action,
+            "preempt": self.preempt,
         }
-        # Only select a model on a new thread; on resume the thread keeps its own.
-        if self._model is not None:
-            body["model_type"] = self._model
-        # PoW challenges are short-lived, so solve right before the request.
-        headers = {"x-ds-pow-response": self._client._pow_header()}
-        meta: dict = {}
+        if self.model_type is not None:
+            payload["model_type"] = self.model_type
+        return payload
+
+    def __iter__(self) -> Iterator[object]:
+        last_error: Optional[DeepSeekAPIError] = None
+        for attempt in range(3):
+            emitted = False
+            try:
+                for event in self._attempt():
+                    emitted = True
+                    yield event
+                return
+            except DeepSeekAPIError as exc:
+                if not exc.is_rate_limit or emitted or attempt == 2:
+                    raise
+                last_error = exc
+                time.sleep(3.0 * (attempt + 1))
+        if last_error is not None:
+            raise last_error
+
+    def _attempt(self) -> Iterator[object]:
+        headers = {"x-ds-pow-response": self._client.pow_header(COMPLETION_PATH)}
         with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=body, headers=headers
+            "POST", COMPLETION_PATH, json=self.body(), headers=headers
         ) as resp:
-            resp.raise_for_status()
-            yield from _parse_sse(resp.iter_lines(), meta)
-        if meta.get("message_id") is not None:
-            self._message_id = meta["message_id"]
+            if resp.status_code >= 400:
+                resp.read()
+                raise DeepSeekAPIError(
+                    f"DeepSeek HTTP {resp.status_code}: {resp.text[:300]}",
+                    status=resp.status_code,
+                )
+            content_type = resp.headers.get("content-type", "")
+            if "application/json" in content_type:
+                resp.read()
+                raise _error_from_body(resp.text, resp.status_code)
+
+            lines = _guarded_lines(resp.iter_lines(), resp.status_code)
+            self._consumed = True
+            for event in iter_events(lines, self.state):
+                yield event
+
+    @property
+    def message_id(self) -> Optional[int]:
+        return self.state.message_id
 
     @property
     def conversation_id(self) -> str:
-        return _encode_cid(self._session_id, self._message_id)
+        return _encode_cid(self.session_id, self.state.message_id)
 
 
-def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
-    """Turn DeepSeek's SSE completion stream into reply-text deltas.
+def _guarded_lines(lines: Iterator[str], status: Optional[int]) -> Iterator[str]:
+    """Yield stream lines, raising if the body is really a JSON error envelope.
 
-    The stream sends an initial snapshot frame whose `v` is the full response
-    object (with `fragments[].content`), then a series of append frames:
-      * {"p":"response/fragments/-1/content","o":"APPEND","v":" what"}  (sets path)
-      * {"v":"'s"}                                                       (appends to it)
-    We track the active append path and emit only RESPONSE-fragment text.
-
-    If `meta` is given, the assistant's `message_id` is recorded into it (used to
-    build the resumable conversation_id). The exact field location can vary, so
-    we look in a few plausible spots defensively.
+    DeepSeek sometimes answers a completion with a plain JSON error (HTTP 200,
+    content-type not set to SSE), e.g. ``biz_code 9 invalid ref file id``.
     """
-    active_path: Optional[str] = None
-    emitted_initial = False
-
+    first_payload_seen = False
     for line in lines:
-        if not line or not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-
-        v = obj.get("v")
-
-        # Snapshot frame: full response object.
-        if isinstance(v, dict) and "response" in v:
-            if meta is not None:
-                _capture_message_id(meta, v)
-            for frag in v["response"].get("fragments", []):
-                if frag.get("type") == "RESPONSE" and frag.get("content"):
-                    active_path = "response/fragments/-1/content"
-                    if not emitted_initial:
-                        emitted_initial = True
-                        yield frag["content"]
-            continue
-
-        # Path-setting append frame.
-        if "p" in obj:
-            active_path = obj["p"]
-            if meta is not None and active_path.endswith("message_id") \
-                    and isinstance(v, int):
-                meta["message_id"] = v
-            if obj.get("o") == "APPEND" and isinstance(v, str) \
-                    and active_path.endswith("content"):
-                yield v
-            continue
-
-        # Bare append to the current path.
-        if isinstance(v, str) and active_path and active_path.endswith("content"):
-            yield v
+        if not first_payload_seen:
+            stripped = line.strip("\r")
+            if not stripped:
+                continue
+            first_payload_seen = True
+            if not (stripped.startswith("data:") or stripped.startswith("event:")):
+                if stripped.startswith("{"):
+                    raise _error_from_body(stripped, status)
+        yield line
 
 
-def _capture_message_id(meta: dict, snapshot: dict) -> None:
-    """Best-effort: pull the assistant message_id out of a snapshot frame.
+def _error_from_body(raw: str, status: Optional[int]) -> DeepSeekAPIError:
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return DeepSeekAPIError(f"DeepSeek returned: {raw[:300]}", status=status)
+    try:
+        _unwrap(payload, status)
+    except DeepSeekAPIError as e:
+        return e
+    return DeepSeekAPIError(f"DeepSeek returned: {raw[:300]}", status=status)
 
-    DeepSeek nests the assistant message under `response`; we check there first,
-    then the snapshot root, accepting `message_id` or `id`.
-    """
-    for container in (snapshot.get("response"), snapshot):
-        if isinstance(container, dict):
-            mid = container.get("message_id", container.get("id"))
-            if isinstance(mid, int):
-                meta["message_id"] = mid
-                return
+
+
+

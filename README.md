@@ -157,8 +157,13 @@ curl http://localhost:8000/v1/chat/completions \
 | Method | Path | Description |
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
+| `POST` | `/v1/files` | Upload an attachment (multipart `file`), returns an OpenAI-style file object |
+| `GET`  | `/v1/files/{id}` | File metadata / parse status |
+| `GET`  | `/v1/files/{id}/content` | Download the stored file |
+| `DELETE` | `/v1/files/{id}` | Forget a file locally |
 | `GET`  | `/v1/models` | Lists the available models |
-| `GET`  | `/healthz` | Health check (rate-limit exempt) |
+| `GET`  | `/healthz` | Liveness (rate-limit exempt) |
+| `GET`  | `/readyz` | Deep check: is the DeepSeek session usable? |
 
 > Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
@@ -218,6 +223,168 @@ model is fixed at creation, so `model` can't be combined with `conversation_id`
 on resume. Unknown model names return a `404` (no silent fallback). See
 [server/config.py](server/config.py).
 
+### Model aliases
+
+Because the model and the two toggles are orthogonal, each combination is
+exposed as its own id:
+
+| Id | Model | DeepThink | Web |
+| --- | --- | --- | --- |
+| `deepseek-chat` | Instant | – | – |
+| `deepseek-chat-think` | Instant | ✓ | – |
+| `deepseek-chat-search` | Instant | – | ✓ |
+| `deepseek-chat-think-search` | Instant | ✓ | ✓ |
+| `deepseek-expert` / `-think` / `-search` / `-think-search` | Expert | per id | per id |
+| `deepseek-vision` | Vision (images/files) | – | – |
+
+Aliases `deepseek-reasoner` and `deepseek-r1` map to `deepseek-chat-think`.
+
+---
+
+## Agent bridge: tools, files and multi-turn
+
+Pointing a coding agent (opencode, Cline, …) at this bridge needs three things
+that the raw DeepSeek web chat does not offer. All three are implemented here:
+
+**1. Tool calling (emulated).** `chat.deepseek.com` has no function-calling
+channel — a `tools` field is silently ignored by the backend. The bridge
+serialises the tool definitions into the prompt, tells the model to answer with
+`<tool_call>{"name":…,"arguments":…}</tool_call>` blocks, then parses those
+blocks back into OpenAI `tool_calls` (with `finish_reason: "tool_calls"`, in
+both streaming and non-streaming mode). It also understands DeepSeek's native
+DSML dialect (`<||DSML|| invoke name="…"> … </||DSML|| invoke>`), which the model
+emits on its own when a host like opencode presents its tool schemas. Tool
+results are rendered back into the next turn, so agent loops work. See [server/toolbridge.py](server/toolbridge.py).
+
+**2. Real multi-turn threading.** Instead of re-sending the whole transcript,
+the bridge maps an OpenAI history to a server-side DeepSeek session and resumes
+it with `parent_message_id`, sending only the new turn.
+
+Threads live in `session/bridge.db` and carry two identifiers:
+
+- **key** — system prompt + model + toggles + tool set.
+- **anchor** — hash of the first non-system message, i.e. the conversation
+  itself. If the agent rewrites its system prompt or the tool set mid-flight,
+  the anchor still finds the thread instead of opening a new session.
+
+Every message DeepSeek assigns an id to is recorded, so the bridge can compare
+the incoming history against the chain it already saw and choose:
+
+| Situation | What happens |
+| --- | --- |
+| History extends the thread | **append** — only the new turn is sent |
+| A message was edited / retried | **branch** — rewind to the last common ancestor and resend only from there (DeepSeek stores it as a sibling branch) |
+| No common prefix | **new session** |
+
+Editing used to open a brand-new session and replay the entire transcript;
+now it costs a single turn.
+
+**`@edit` marker.** Put `@edit [N] <instruction>` as the last user message to
+rewind to the N-th answer from the end (default 1) and steer it:
+
+```text
+@edit 1 sé más breve y cita la fuente
+```
+
+The bridge truncates the history at that answer and sends the instruction as
+the new turn, so the fork is reused instead of replayed.
+
+Set `THREAD_TTL_HOURS` to control retention.
+
+### Turn directives
+
+Capabilities are toggled **per turn**, without switching models or starting a
+new chat. Write the directive at the very start of the message:
+
+| Directive | Effect |
+| --- | --- |
+| `@think <text>` | enables DeepThink reasoning for this turn |
+| `@search <text>` | runs DeepSeek's server-side web search |
+| `@think @search <text>` | both |
+| `@edit [N] <text>` | rewinds to the N-th answer (default 1) and rewrites it |
+
+Aliases are accepted because opencode binds `@` to file mentions and may swallow
+it: `!think`, `/think`, `#think`, `@piensa`, `@busca`, `@web`.
+
+The directive is stripped before the prompt is built, and the flags are sent in
+the completion body, so the thread is reused. Verified against the live backend:
+a second turn on an existing thread returned `reasoning_content` (~500 chars)
+and `annotations` with real sources.
+
+### Context guarantees (agent loops)
+
+Verified end-to-end over the HTTP surface that opencode uses:
+
+| Behaviour | Result |
+| --- | --- |
+| Several tools in one assistant turn | parsed and returned as multiple `tool_calls` |
+| Tool results fed back | rendered into the next turn; the loop continues |
+| Context after a tool round | the next question is answered without re-reading |
+| History extends | **append** — only the new turn travels upstream |
+| Message edited / retried | **branch** — rewinds to the last common ancestor |
+
+What can still reset context, and why:
+
+- **`THREAD_TTL_HOURS` (12 by default).** An idle thread is dropped; the next
+  request starts a new session and replays the transcript once.
+- **A failed session.** If DeepSeek invalidates the login, the request fails with
+  `503 login_required`; the thread survives, so context resumes after re-login.
+- **Tool output larger than `MAX_TOOL_RESULT_CHARS` (16000).** It is *condensed*,
+  not blindly cut: a header with the real size, an index of structural lines
+  (`def`, `class`, headings, `key: value` blocks) with line numbers, the
+  beginning, the end, and a hint to re-read with offset/limit. Raise the limit
+  with the env var if you prefer the raw text.
+- **A fork point with no recorded id.** The bridge walks back to the nearest
+  ancestor it knows; if there is none, it starts a new session.
+
+The fork point is always an **assistant** message: a prompt creates a user turn,
+and DeepSeek rejects user → user with `invalid message role`.
+
+**3. Files and vision.** `POST /v1/files` uploads through DeepSeek's own
+attachment endpoint (proof-of-work gated), waits for the file to finish parsing,
+and returns an id. Attach it in a message as
+`{"type":"file","file_id":"file-…"}`, or send an `image_url` part and the bridge
+will upload it for you (switching the thread to the vision model).
+
+**Reasoning and citations.** With `@think` (or a `-think` model), chain-of-thought
+is returned as `reasoning_content` (streamed as `delta.reasoning_content`) instead
+of being mixed into the answer. With `@search` (or a `-search` model), sources come
+back in `search_results` + `annotations`, and a compact `Fuentes:` list is appended
+to the answer so `[citation:N]` markers are resolvable.
+
+**Recommended setup for opencode.** Expose exactly two models and let the
+directives do the rest:
+
+| Model id | Maps to | Use |
+| --- | --- | --- |
+| `deepseek` | Instant (default) | fast, "flash"-like |
+| `deepseek-expert` | Expert | hard problems |
+
+Both support tools, attachments, `@think`, `@search` and `@edit`. The `-think` /
+`-search` aliases remain available but are no longer needed
+(`deepseek-chat-think`, `deepseek-chat-search`, …).
+
+> opencode configures tools per **agent**, not per model, so the bridge cannot
+> intercept opencode's own `websearch`. `@search` uses DeepSeek's search instead,
+> which runs server-side and returns `annotations`.
+
+**3. Files and vision.** `POST /v1/files` uploads through DeepSeek's own
+attachment endpoint (proof-of-work gated), waits for the file to finish parsing,
+and returns an id. Attach it in a message as
+`{"type":"file","file_id":"file-…"}`, or send an `image_url` part and the bridge
+will upload it for you (switching the thread to the vision model).
+
+**Reasoning and citations.** With a `-think` model, chain-of-thought is returned
+as `reasoning_content` (streamed as `delta.reasoning_content`) instead of being
+mixed into the answer. With a `-search` model, sources come back in
+`search_results` + `annotations`, and a compact `Fuentes:` list is appended to
+the answer so `[citation:N]` markers are resolvable.
+
+**Reality check.** This is emulation over a consumer web app, not a model API:
+upstream calls are serialised over one account, tool-calling is prompt-driven
+(slightly less reliable than native), and DeepSeek's own rate limits still
+apply. Use it in moderation.
+
 ---
 
 ## Concurrency
@@ -268,9 +435,9 @@ yourself.
 
 - **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
 - **Be reasonable.** Please use it in moderation, and don't spam or hammer it with automated bulk requests.
-- **No real token counts.** `usage` in responses is a rough ~4-chars/token estimate.
-- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); only `model`, `messages`, `stream`, `conversation_id`, `thinking`, and `search` do anything.
-- **Vision is deferred.** It needs image-upload plumbing that isn't built yet.
+- **Token counts are approximate on the prompt side.** Completion tokens come from DeepSeek's own counter; prompt tokens are estimated (~3 chars/token).
+- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); `model`, `messages`, `stream`, `tools`, `tool_choice`, `conversation_id`, `thinking` and `search` are the ones that do something.
+- **Vision and files work** through `POST /v1/files` and `image_url`/`file` content parts.
 - **Your session is private.** Everything in `session/` (cookies + token) stays on your machine and is git-ignored.
 
 ## License
@@ -278,4 +445,6 @@ yourself.
 Released under the [MIT License](LICENSE). As this is an unofficial project, you remain responsible for complying with DeepSeek's terms of service.
 
 ---
+
+
 

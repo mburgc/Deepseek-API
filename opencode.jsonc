@@ -1,0 +1,46 @@
+// Config de opencode para el bridge local.
+//
+// Dos modelos, los mismos para todos:
+//   deepseek-api/deepseek         -> rapido (equivalente a "flash")
+//   deepseek-api/deepseek-expert  -> el fuerte
+//
+// Los dos soportan tool calling, archivos/vision y @edit.
+// El razonamiento y la busqueda web se activan por turno, escribiendo al
+// principio del mensaje:
+//
+//   @think  explicame esto a fondo        -> razonamiento profundo
+//   @search que paso hoy en chile         -> busqueda web de DeepSeek
+//   @think @search ...                    -> las dos
+//   @edit 1 mas breve                     -> reescribe la ultima respuesta
+//
+// (Tambien valen !think, /think, #think, @piensa, @busca, @web: opencode usa
+//  `@` para mencionar archivos y a veces lo intercepta.)
+//
+// Copia este bloque dentro de tu opencode.json / opencode.jsonc.
+
+{
+  "provider": {
+    "deepseek-api": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek API (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "deepseek": {
+          "name": "DeepSeek (rapido)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 800000, "output": 32768 }
+        },
+        "deepseek-expert": {
+          "name": "DeepSeek Expert",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": { "context": 800000, "output": 32768 }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,122 @@
+event: ready
+data: {"request_message_id":1,"response_message_id":2,"model_type":"default"}
+event: update_session
+data: {"updated_at":1792856942.075821}
+data: {"v":{"response":{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","thinking_enabled":false,"ban_edit":false,"ban_regenerate":false,"status":"WIP","incomplete_message":null,"accumulated_token_usage":0,"feedback":null,"inserted_at":1792856942.0622878,"search_enabled":false,"fragments":[{"id":2,"type":"RESPONSE","content":"I","references":[],"stage_id":1}],"conversation_mode":"DEFAULT","has_pending_fragment":false,"auto_continue":false,"search_triggered":false,"extra_search_providers":[]}}}
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":" can"}
+data: {"v":"'t"}
+data: {"v":" call"}
+data: {"v":" functions"}
+data: {"v":" or"}
+data: {"v":" access"}
+data: {"v":" external"}
+data: {"v":" tools"}
+data: {"v":" in"}
+data: {"v":" this"}
+data: {"v":" conversation"}
+data: {"v":"—"}
+data: {"v":"I"}
+data: {"v":" don"}
+data: {"v":"'t"}
+data: {"v":" have"}
+data: {"v":" a"}
+data: {"v":" `"}
+data: {"v":"get"}
+data: {"v":"_"}
+data: {"v":"weather"}
+data: {"v":"`"}
+data: {"v":" function"}
+data: {"v":" available"}
+data: {"v":" to"}
+data: {"v":" me"}
+data: {"v":" here"}
+data: {"v":".\n\n"}
+data: {"v":"To"}
+data: {"v":" get"}
+data: {"v":" Paris"}
+data: {"v":" weather"}
+data: {"v":","}
+data: {"v":" you"}
+data: {"v":" could"}
+data: {"v":":\n"}
+data: {"v":"-"}
+data: {"v":" Use"}
+data: {"v":" a"}
+data: {"v":" weather"}
+data: {"v":" API"}
+data: {"v":" ("}
+data: {"v":"e"}
+data: {"v":".g"}
+data: {"v":".,"}
+data: {"v":" Open"}
+data: {"v":"Weather"}
+data: {"v":"Map"}
+data: {"v":","}
+data: {"v":" Weather"}
+data: {"v":"API"}
+data: {"v":")"}
+data: {"v":" with"}
+data: {"v":" a"}
+data: {"v":" quick"}
+data: {"v":" script"}
+data: {"v":"\n"}
+data: {"v":"-"}
+data: {"v":" Check"}
+data: {"v":" a"}
+data: {"v":" weather"}
+data: {"v":" site"}
+data: {"v":"/app"}
+data: {"v":" directly"}
+data: {"v":"\n"}
+data: {"v":"-"}
+data: {"v":" If"}
+data: {"v":" you"}
+data: {"v":"'re"}
+data: {"v":" working"}
+data: {"v":" in"}
+data: {"v":" a"}
+data: {"v":" platform"}
+data: {"v":" that"}
+data: {"v":" supports"}
+data: {"v":" function"}
+data: {"v":" calling"}
+data: {"v":" ("}
+data: {"v":"like"}
+data: {"v":" an"}
+data: {"v":" API"}
+data: {"v":" integration"}
+data: {"v":"),"}
+data: {"v":" share"}
+data: {"v":" the"}
+data: {"v":" function"}
+data: {"v":" schema"}
+data: {"v":" and"}
+data: {"v":" I"}
+data: {"v":" can"}
+data: {"v":" help"}
+data: {"v":" you"}
+data: {"v":" write"}
+data: {"v":" the"}
+data: {"v":" call"}
+data: {"v":"\n\n"}
+data: {"v":"Want"}
+data: {"v":" help"}
+data: {"v":" writing"}
+data: {"v":" the"}
+data: {"v":" code"}
+data: {"v":" to"}
+data: {"v":" call"}
+data: {"v":" a"}
+data: {"v":" weather"}
+data: {"v":" API"}
+data: {"v":" for"}
+data: {"v":" Paris"}
+data: {"v":"?"}
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":152},{"p":"quasi_status","v":"FINISHED"}]}
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+event: update_session
+data: {"updated_at":1792856942.991226}
+event: title
+data: {"content":"Cannot call get_weather"}
+event: close
+data: {"click_behavior":"none","auto_resume":false}
