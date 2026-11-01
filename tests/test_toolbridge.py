@@ -221,3 +221,124 @@ def test_stream_holds_back_dsml():
     assert [kind for kind, _ in parts] == ["tool_calls"]
     assert parts[0][1][0].name == "read"
     assert parts[0][1][0].arguments == {"p": "x"}
+
+
+# --- Windows paths, escapes and prose JSON ----------------------------------
+
+
+def test_windows_path_with_single_backslashes_is_recovered():
+    text = (
+        r'<tool_call>{"name":"read","arguments":'
+        r'{"filePath":"D:\ProjectoRTS\Assets\Scripts\WaveManager.cs"}}</tool_call>'
+    )
+    _, calls = parse_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["filePath"] == "D:/ProjectoRTS/Assets/Scripts/WaveManager.cs"
+
+
+def test_windows_path_with_control_escapes_is_recovered():
+    text = (
+        r'<tool_call>{"name":"read","arguments":'
+        r'{"filePath":"D:\tools\new\build\foo.cs"}}</tool_call>'
+    )
+    _, calls = parse_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["filePath"] == "D:/tools/new/build/foo.cs"
+
+
+def test_report_windows_paths_are_all_recovered():
+    paths = [
+        r"D:\Deepseek\DeepSeek-Bridge-v1.0",
+        r"D:\Deepseek\DeepSeek-Bridge-v1.0\src\bridge\plugin.ts",
+        r"C:\Users\PANTRUCAS0\AppData\Local\Temp\opencode\robust1.txt",
+        r"D:\ProjectoRTS\Assets\Scripts\WaveManager.cs",
+    ]
+    for path in paths:
+        text = (
+            '<tool_call>{"name":"read","arguments":'
+            '{"filePath":"' + path + '"}}</tool_call>'
+        )
+        _, calls = parse_tool_calls(text)
+        assert len(calls) == 1, path
+        assert calls[0].arguments["filePath"] == path.replace("\\", "/")
+
+
+def test_edit_arguments_accept_raw_newlines():
+    text = (
+        '<tool_call>{"name":"edit","arguments":'
+        '{"filePath":"a.cs","oldString":"line1\nline2","newString":"line3\nline4"}}'
+        "</tool_call>"
+    )
+    _, calls = parse_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["oldString"] == "line1\nline2"
+    assert calls[0].arguments["newString"] == "line3\nline4"
+
+
+def test_regex_pattern_keeps_backslash_escapes():
+    text = r'<tool_call>{"name":"grep","arguments":{"pattern":"WaveCleared\b"}}</tool_call>'
+    _, calls = parse_tool_calls(text)
+
+    assert len(calls) == 1
+    assert calls[0].arguments["pattern"] == "WaveCleared\\b"
+
+
+def test_prose_json_is_not_a_tool_call():
+    text = (
+        "El componente se ve asi:\n"
+        '{"name":"WaveManager","speed":5}\n'
+        "Y se usa en la escena 3."
+    )
+    visible, calls = parse_tool_calls(text, allowed_names={"read"})
+
+    assert calls == []
+    assert visible == text
+
+
+def test_bare_json_only_counts_when_the_name_is_known():
+    text = '{"name":"WaveManager","speed":5}'
+    visible, calls = parse_tool_calls(text, allowed_names={"read"})
+
+    assert calls == []
+    assert visible == text
+
+
+def test_bare_json_with_known_name_still_works():
+    text = '{"name":"read","arguments":{"path":"a.txt"}}'
+    _, calls = parse_tool_calls(text, allowed_names={"read"})
+
+    assert len(calls) == 1
+    assert calls[0].name == "read"
+
+
+def test_fenced_json_inside_prose_is_not_a_tool_call():
+    text = 'Ejemplo:\n```json\n{"name":"WaveManager","speed":5}\n```\nFin.'
+    visible, calls = parse_tool_calls(text, allowed_names={"read"})
+
+    assert calls == []
+    assert visible == text
+
+
+def test_mixed_json_and_dsml_are_both_parsed():
+    bar = chr(0xFF5C)
+    json_call = (
+        '<tool_call>{"name":"read","arguments":'
+        '{"filePath":"D:/ProjectoRTS/A.cs"}}</tool_call>'
+    )
+    dsml_call = (
+        f"<{bar}{bar}DSML{bar}{bar} invoke name=\"read\">\n"
+        f"<{bar}{bar}DSML{bar}{bar} parameter name=\"filePath\" string=\"true\">"
+        f"D:/ProjectoRTS/B.cs</{bar}{bar}DSML{bar}{bar} parameter>\n"
+        f"</{bar}{bar}DSML{bar}{bar} invoke>"
+    )
+    visible, calls = parse_tool_calls(json_call + "\n" + dsml_call)
+
+    assert [c.arguments["filePath"] for c in calls] == [
+        "D:/ProjectoRTS/A.cs",
+        "D:/ProjectoRTS/B.cs",
+    ]
+    assert "<tool_call>" not in visible
+    assert "DSML" not in visible

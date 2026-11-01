@@ -25,6 +25,10 @@ CLOSE_TAG = "</tool_call>"
 _BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
 _PIPE_TAG_RE = re.compile(r"<\|tool_call\|>\s*(.*?)\s*<\|/tool_call\|>", re.S | re.I)
 _FENCE_RE = re.compile(r"```(?:tool_call|tool|json)?[ \t]*\r?\n(.*?)```", re.S | re.I)
+_WHOLE_FENCE_RE = re.compile(
+    r"^\s*```(?:tool_call|tool|json)?[ \t]*\r?\n(.*?)\r?\n```\s*$",
+    re.S | re.I,
+)
 _JSON_START_RE = re.compile(r"^\s*\{")
 
 _STREAM_MARKERS = (
@@ -42,6 +46,28 @@ _HOLD_CHARS = 32
 
 _ARG_KEYS = ("arguments", "parameters", "args", "params", "input")
 _NAME_KEYS = ("name", "tool", "tool_name", "function_name")
+
+_PATH_KEYS = {
+    "filepath",
+    "file_path",
+    "filename",
+    "path",
+    "cwd",
+    "directory",
+    "dir",
+    "folder",
+    "workdir",
+    "root",
+}
+_REGEX_KEYS = {"pattern", "regex", "query", "expression"}
+_CONTROL_ESCAPES = {
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
+_INVALID_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
 
 
 @dataclass
@@ -118,6 +144,8 @@ def render_tools_block(tools: Optional[Iterable[Any]], tool_choice: Any = None) 
         "- To call several tools, emit several blocks back to back.",
         "- After calling tools, stop and wait: the results arrive in the next message.",
         "- When you can answer without a tool, reply in plain text with no tool block.",
+        "- If a tool result says RESULTADO INCOMPLETO, re-read with offset/limit before answering about it. Never invent lines, counts or hashes.",
+        "- On Windows, write paths with forward slashes (D:/dir/file) or double every backslash.",
     ]
     if mode == "required":
         lines.append("- You MUST call at least one tool in this reply.")
@@ -148,15 +176,24 @@ def has_tool_syntax(text: str) -> bool:
     )
 
 
-def parse_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
+def parse_tool_calls(
+    text: str,
+    allowed_names: Optional[Iterable[str]] = None,
+) -> Tuple[str, List[ToolCall]]:
     """Split model output into (visible_text, tool_calls).
 
     Handles the canonical tag form, OpenAI-style JSON, `{"tool_calls": [...]}`
     wrappers, fenced JSON, bare JSON objects, and common JSON malformations.
+
+    ``allowed_names`` (the tool set sent in the request) is used to reject
+    prose JSON that merely happens to have a ``name`` field.  Explicit
+    ``<tool_call>``/DSML blocks are always honoured, even for an unknown name:
+    the client can then report the unknown tool instead of silently losing it.
     """
     if not text:
         return "", []
 
+    allowed = {str(name) for name in allowed_names} if allowed_names is not None else None
     calls: List[ToolCall] = []
     spans: List[Tuple[int, int]] = []
 
@@ -168,27 +205,46 @@ def parse_tool_calls(text: str) -> Tuple[str, List[ToolCall]]:
                 spans.append(match.span())
 
     if not calls:
-        for match in _FENCE_RE.finditer(text):
-            body = match.group(1)
-            parsed = _parse_payload(body)
+        match = _WHOLE_FENCE_RE.match(text)
+        if match:
+            parsed = _allowed_calls(_parse_payload(match.group(1)), allowed)
             if parsed:
                 calls.extend(parsed)
                 spans.append(match.span())
 
     if not calls:
-        parsed = _parse_payload(text)
-        if parsed:
-            calls.extend(parsed)
-            spans.append((0, len(text)))
+        data = _loads_json(text, extract=False)
+        if data is not None:
+            parsed = _allowed_calls(_calls_from_data(data, text), allowed)
+            if parsed:
+                calls.extend(parsed)
+                spans.append((0, len(text)))
+
+    _, dsml_calls = parse_dsml_tool_calls(text)
+    if dsml_calls:
+        calls.extend(dsml_calls)
 
     if not calls:
-        dsml_text, dsml_calls = parse_dsml_tool_calls(text)
-        if dsml_calls:
-            return dsml_text, dsml_calls
         return text, []
 
     visible = _strip_spans(text, spans).strip()
+    visible = _strip_dsml_constructs(visible).strip()
     return visible, calls
+
+
+def _allowed_calls(calls: List[ToolCall], allowed: Optional[set]) -> List[ToolCall]:
+    if allowed is None:
+        return calls
+    return [call for call in calls if call.name in allowed]
+
+
+def _strip_dsml_constructs(text: str) -> str:
+    if not text or not _DSML_START.search(text):
+        return text
+    normalized = _normalize_dsml(text)
+    normalized = _DSML_BLOCK.sub("", normalized)
+    normalized = _DSML_INVOKE.sub("", normalized)
+    return normalized
 
 
 def _strip_spans(text: str, spans: List[Tuple[int, int]]) -> str:
@@ -226,7 +282,7 @@ def _calls_from_data(data: Any, raw: str) -> List[ToolCall]:
         return [
             ToolCall(
                 name=str(function["name"]),
-                arguments=_coerce_arguments(function),
+                arguments=_normalize_arguments(_coerce_arguments(function)),
                 call_id=data.get("id"),
                 raw=raw,
             )
@@ -237,7 +293,7 @@ def _calls_from_data(data: Any, raw: str) -> List[ToolCall]:
         return [
             ToolCall(
                 name=name.strip(),
-                arguments=_coerce_arguments(data),
+                arguments=_normalize_arguments(_coerce_arguments(data)),
                 call_id=data.get("id"),
                 raw=raw,
             )
@@ -274,7 +330,7 @@ def _first_present(data: Dict[str, Any], keys: Iterable[str]) -> Any:
     return None
 
 
-def _loads_json(text: str) -> Any:
+def _loads_json(text: str, *, extract: bool = True) -> Any:
     if not isinstance(text, str):
         return None
     candidate = text.strip()
@@ -283,14 +339,78 @@ def _loads_json(text: str) -> Any:
     candidate = re.sub(r"^```[a-zA-Z_]*\s*", "", candidate)
     candidate = re.sub(r"\s*```$", "", candidate)
 
-    for attempt in (candidate, _repair_json(candidate), _extract_json_object(candidate)):
+    attempts = [candidate]
+    repaired = _repair_json(candidate)
+    if repaired not in attempts:
+        attempts.append(repaired)
+    escaped = _repair_invalid_backslashes(candidate)
+    if escaped not in attempts:
+        attempts.append(escaped)
+    repaired_escaped = _repair_json(escaped)
+    if repaired_escaped not in attempts:
+        attempts.append(repaired_escaped)
+
+    if extract:
+        extracted = _extract_json_object(candidate)
+        if extracted:
+            if extracted not in attempts:
+                attempts.append(extracted)
+            extracted_escaped = _repair_invalid_backslashes(extracted)
+            if extracted_escaped not in attempts:
+                attempts.append(extracted_escaped)
+
+    for attempt in attempts:
         if not attempt:
             continue
         try:
-            return json.loads(attempt)
+            return json.loads(attempt, strict=False)
         except (ValueError, TypeError):
             continue
     return None
+
+
+def _repair_invalid_backslashes(text: str) -> str:
+    """Escape backslashes that are not valid JSON escapes.
+
+    Models writing Windows paths often emit ``D:\\Project`` with a single
+    backslash.  JSON rejects ``\\P`` (and ``\\A``, ``\\S``...), so the call
+    would be dropped entirely.  Doubling only the invalid ones keeps the path
+    intact while leaving real escapes (``\\n``, ``\\t``) alone.
+    """
+    return _INVALID_ESCAPE_RE.sub(r"\\\\", text)
+
+
+def _restore_control_escapes(value: str) -> str:
+    for char, escape in _CONTROL_ESCAPES.items():
+        value = value.replace(char, escape)
+    return value
+
+
+def _normalize_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Un-mangle Windows paths and regexes decoded from JSON.
+
+    JSON turns ``\\t``/``\\n``/``\\b``/``\\f`` into control characters even
+    when the model meant a literal backslash in a Windows path.  In path
+    fields we put the escape back and switch to forward slashes (accepted by
+    Windows and by every tool we target).  In regex fields we restore the
+    escape without changing the separator.
+    """
+    if not isinstance(arguments, dict):
+        return arguments
+    for key, value in list(arguments.items()):
+        lower = key.lower()
+        if isinstance(value, str):
+            if lower in _PATH_KEYS:
+                arguments[key] = _restore_control_escapes(value).replace("\\", "/")
+            elif lower in _REGEX_KEYS:
+                arguments[key] = _restore_control_escapes(value)
+        elif isinstance(value, dict):
+            _normalize_arguments(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _normalize_arguments(item)
+    return arguments
 
 
 def _repair_json(text: str) -> str:
@@ -338,8 +458,9 @@ class ToolCallStream:
     after a marker (or a leading JSON object) is held back.
     """
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, allowed_names: Optional[Iterable[str]] = None):
         self.enabled = enabled
+        self.allowed_names = allowed_names
         self.buffer = ""
         self.emitted = 0
         self.holding = False
@@ -389,7 +510,7 @@ class ToolCallStream:
         if not self.enabled:
             return []
 
-        visible, calls = parse_tool_calls(remainder)
+        visible, calls = parse_tool_calls(remainder, allowed_names=self.allowed_names)
         if calls:
             if visible.strip():
                 self.saw_text = True

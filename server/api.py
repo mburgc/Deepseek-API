@@ -28,6 +28,7 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,7 +52,7 @@ from .config import (
     UPSTREAM_SERIALIZE,
     resolve_model,
 )
-from .content import as_message_dicts, file_parts, image_parts, text_of
+from .content import as_message_dicts, canonical_hash, file_parts, image_parts, text_of
 from .openai_format import (
     Answer,
     collect_answer,
@@ -65,7 +66,7 @@ from .openai_format import (
 )
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
-from .threads import ThreadStore, message_hash
+from .threads import ThreadStore
 from .toolbridge import tool_choice_mode
 
 load_dotenv()
@@ -137,6 +138,42 @@ install_rate_limit(
 )
 
 _upstream_lock = threading.Lock() if UPSTREAM_SERIALIZE else None
+
+# Serialises the whole completion flow (plan -> upstream request -> save).
+# UPSTREAM_SERIALIZE only protects the stream iterator; two requests could
+# still plan from the same parent and overwrite each other's thread row.
+_flow_lock = threading.Lock()
+
+
+def _serialized(func):
+    """Hold the flow lock until a streaming response has been fully sent."""
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        await run_in_threadpool(_flow_lock.acquire)
+        try:
+            response = await func(*args, **kwargs)
+        except BaseException:
+            _flow_lock.release()
+            raise
+
+        if not isinstance(response, StreamingResponse):
+            _flow_lock.release()
+            return response
+
+        original = response.body_iterator
+
+        async def body():
+            try:
+                async for chunk in original:
+                    yield chunk
+            finally:
+                _flow_lock.release()
+
+        response.body_iterator = body()
+        return response
+
+    return wrapper
 
 
 class _LockedStream:
@@ -288,17 +325,23 @@ def _profile_hash(messages: List[Dict]) -> str:
 
 
 def _thread_anchor(messages: List[Dict]) -> str:
-    """Conversation identity: the first non-system message.
+    """Conversation identity: the first two non-system messages.
 
-    Stable across turns even when the agent rewrites its system prompt or the
-    tool set between requests, which is what lets a conversation survive a
-    profile change instead of opening a new DeepSeek session.
+    Using only the first message made two unrelated sessions that opened with
+    the same greeting (or the same bootstrap prompt) share a thread.  Two
+    messages make that collision much less likely while still surviving a
+    system-prompt or tool-set change.
     """
+    picked = []
     for message in messages:
         if (message.get("role") or "") in ("system", "developer"):
             continue
-        return message_hash(message)[:32]
-    return ""
+        picked.append(message)
+        if len(picked) == 2:
+            break
+    if not picked:
+        return ""
+    return canonical_hash(picked)[:32]
 
 
 _EDIT_RE = re.compile(r"^@edit(?:\s+(\d+))?(?:\s+([\s\S]+))?$", re.IGNORECASE)
@@ -523,6 +566,7 @@ def _remember_thread(
 
 
 @app.post("/v1/chat/completions")
+@_serialized
 async def chat_completions(req: ChatCompletionRequest):
     if not req.messages:
         return _error("`messages` must not be empty", 400, "invalid_request_error")
@@ -548,6 +592,11 @@ async def chat_completions(req: ChatCompletionRequest):
         search = True
     mode, _forced = tool_choice_mode(req.tool_choice)
     tools_enabled = bool(req.tools) and mode != "none"
+    tool_names = [
+        tool.function.name
+        for tool in (req.tools or [])
+        if getattr(getattr(tool, "function", None), "name", None)
+    ]
 
     try:
         services = await run_in_threadpool(get_services)
@@ -622,6 +671,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     prompt=prompt,
                     include_usage=req.includes_usage(),
                     tools_enabled=tools_enabled,
+                    tool_names=tool_names,
                     result=outcome,
                 )
             except Exception as exc:
@@ -648,7 +698,11 @@ async def chat_completions(req: ChatCompletionRequest):
 
     try:
         answer = await run_in_threadpool(
-            lambda: collect_answer(serialized, tools_enabled=tools_enabled)
+            lambda: collect_answer(
+                serialized,
+                tools_enabled=tools_enabled,
+                tool_names=tool_names,
+            )
         )
     except Exception as exc:
         return _map_exception(exc)

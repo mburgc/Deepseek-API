@@ -157,3 +157,44 @@ def test_malformed_and_non_data_lines_are_ignored():
     events = list(iter_events(lines, state))
     assert text_of(events) == "ok"
     assert state.message_id == 9
+
+
+def _snapshot(content: str) -> str:
+    return (
+        'data: {"v":{"response":{"message_id":1,"fragments":'
+        '[{"type":"RESPONSE","content":"' + content + '"}]}}}'
+    )
+
+
+def test_repeated_snapshot_does_not_duplicate_text():
+    events = list(iter_events([_snapshot("abc"), _snapshot("abc")], StreamState()))
+
+    assert text_of(events) == "abc"
+
+
+def test_enlarged_snapshot_emits_only_the_delta():
+    events = list(iter_events([_snapshot("abc"), _snapshot("abcdef")], StreamState()))
+
+    assert text_of(events) == "abcdef"
+
+
+def test_snapshot_after_patches_does_not_replay_the_prefix():
+    lines = [
+        _snapshot("abc"),
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"def"}',
+        _snapshot("abcdef"),
+    ]
+    events = list(iter_events(lines, StreamState()))
+
+    assert text_of(events) == "abcdef"
+
+
+def test_set_rewrite_does_not_duplicate_the_old_content():
+    lines = [
+        _snapshot("hola"),
+        'data: {"p":"response/fragments/-1/content","o":"SET","v":"hola mundo"}',
+        'data: {"p":"response/fragments/-1/content","o":"SET","v":"otra cosa"}',
+    ]
+    events = list(iter_events(lines, StreamState()))
+
+    assert text_of(events) == "hola mundo"

@@ -138,7 +138,7 @@ def _handle_frame(obj: Dict, fragments: List[Dict], st: StreamState,
 
     # Bare append to the active (last) fragment.
     if isinstance(value, str) and fragments:
-        yield from _emit(fragments[-1], value)
+        yield from _emit(fragments[-1], value, st)
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +167,8 @@ def _apply_snapshot(resp: Dict, fragments: List[Dict], st: StreamState) -> Itera
         st.token_usage = usage
 
     fragments.clear()
+    text_entries: List[Dict] = []
+    think_entries: List[Dict] = []
     for frag in resp.get("fragments") or []:
         if not isinstance(frag, dict):
             continue
@@ -185,8 +187,20 @@ def _apply_snapshot(resp: Dict, fragments: List[Dict], st: StreamState) -> Itera
             results = frag.get("results") or []
             if results:
                 yield from _merge_results(results, st)
-        else:
-            yield from _emit_full(entry, entry["content"])
+        elif entry["type"] in _THINK_TYPES:
+            think_entries.append(entry)
+        elif entry["type"] in _TEXT_TYPES:
+            text_entries.append(entry)
+
+    full_answer = "".join(entry["content"] for entry in text_entries)
+    answer_delta = _new_suffix(full_answer, st.emitted_answer)
+    if answer_delta and text_entries:
+        yield from _emit(text_entries[-1], answer_delta, st)
+
+    full_reasoning = "".join(entry["content"] for entry in think_entries)
+    reasoning_delta = _new_suffix(full_reasoning, st.emitted_reasoning)
+    if reasoning_delta and think_entries:
+        yield from _emit(think_entries[-1], reasoning_delta, st)
 
     if mid is not None and not had_ready:
         # No `event: ready` frame: announce the id now so callers can resume.
@@ -219,7 +233,7 @@ def _apply_patch(patch: Dict, fragments: List[Dict], st: StreamState) -> Iterato
                     if frag.get("results"):
                         yield from _merge_results(frag["results"], st)
                 else:
-                    yield from _emit_full(entry, entry["content"])
+                    yield from _emit(entry, entry["content"], st)
         return
 
     if path.startswith("response/fragments/"):
@@ -271,18 +285,22 @@ def _apply_fragment_field(frag: Dict, field_path: str, op: str, value,
         if field != "content":
             # An explicit reasoning path inside a fragment.
             frag["content"] = (frag.get("content") or "") + value
+            st.emitted_reasoning += value
             yield ReasoningDelta(value)
             return
         old = frag.get("content") or ""
         if op == "APPEND":
             frag["content"] = old + value
-            yield from _emit(frag, value)
+            yield from _emit(frag, value, st)
         else:
             frag["content"] = value
             if value.startswith(old):
-                yield from _emit(frag, value[len(old):])
-            else:
-                yield from _emit_full(frag, value, replace=True)
+                delta = value[len(old):]
+                if delta:
+                    yield from _emit(frag, delta, st)
+            # A SET that does not extend the old content is a rewrite.  SSE
+            # cannot retract text already sent, so ignore it instead of
+            # duplicating the whole fragment.
         return
 
     if field == "results":
@@ -310,24 +328,32 @@ def _apply_fragment_field(frag: Dict, field_path: str, op: str, value,
 # --------------------------------------------------------------------------
 
 
-def _emit(frag: Dict, text: str) -> Iterator[object]:
+def _emit(frag: Dict, text: str, st: Optional[StreamState] = None) -> Iterator[object]:
     if not text:
         return
     ftype = frag.get("type")
     if ftype in _THINK_TYPES:
+        if st is not None:
+            st.emitted_reasoning += text
         yield ReasoningDelta(text)
     elif ftype in _TEXT_TYPES:
+        if st is not None:
+            st.emitted_answer += text
         yield TextDelta(text)
 
 
-def _emit_full(frag: Dict, text: str, replace: bool = False) -> Iterator[object]:
-    if not text:
-        return
-    ftype = frag.get("type")
-    if ftype in _THINK_TYPES:
-        yield ReasoningDelta(text)
-    elif ftype in _TEXT_TYPES:
-        yield TextDelta(text)
+def _emit_full(frag: Dict, text: str, replace: bool = False,
+               st: Optional[StreamState] = None) -> Iterator[object]:
+    yield from _emit(frag, text, st)
+
+
+def _new_suffix(full: str, emitted: str) -> str:
+    """The part of a snapshot that has not been sent to the client yet."""
+    if not full:
+        return ""
+    if full.startswith(emitted):
+        return full[len(emitted):]
+    return ""
 
 
 def _resolve_fragment(index_part: str, fragments: List[Dict]) -> Optional[Dict]:

@@ -49,3 +49,12 @@ def test_small_budget_still_produces_something_useful():
 def test_zero_limit_disables_digest():
     text = "x" * 1000
     assert digest_tool_output(text, 0) == text
+
+
+def test_digest_warns_against_inventing_missing_content():
+    text = "\n".join(f"def funcion_{i}():" for i in range(3000))
+    out = digest_tool_output(text, 4000)
+
+    assert "RESULTADO INCOMPLETO" in out
+    assert "NO inventes" in out
+    assert "offset/limit" in out

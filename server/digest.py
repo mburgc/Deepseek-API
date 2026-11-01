@@ -71,13 +71,18 @@ def digest_tool_output(text: str, limit: int) -> str:
 
     lines = text.splitlines()
     total_lines = len(lines)
-    header = f"[truncado: {total_lines} lineas / {len(text)} chars]\n"
+    header = (
+        f"[truncado: {total_lines} lineas / {len(text)} chars]\n"
+        "[RESULTADO INCOMPLETO: NO inventes lineas, conteos ni hashes. "
+        "Si necesitas el contenido omitido, volve a leerlo con offset/limit.]\n"
+    )
 
     index = _index_block(lines) if limit >= 1500 else ""
     hint = (
         "### nota\n"
-        "Contenido recortado. Para ver una parte concreta, volve a leerlo con "
-        "offset/limit (o pedi un rango de lineas).\n"
+        "Contenido recortado. No supongas ni inventes lo que falta. "
+        "Para ver una parte concreta, volve a leerlo con offset/limit "
+        "(o pedi un rango de lineas).\n"
     )
 
     overhead = len(header) + len(index) + len(hint) + len("### inicio\n") + len("\n...\n### final\n")

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 
 import pytest
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 import server.api as api
@@ -271,3 +274,39 @@ def test_readyz_reports_session(wired):
     response = client_http.get("/readyz")
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+
+
+def test_serialized_endpoint_holds_the_lock_until_the_stream_finishes():
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+
+    @api._serialized
+    async def endpoint():
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+
+        async def body():
+            nonlocal active
+            try:
+                yield b"uno"
+                await asyncio.sleep(0.05)
+            finally:
+                with guard:
+                    active -= 1
+
+        return StreamingResponse(body())
+
+    async def call():
+        response = await endpoint()
+        async for _ in response.body_iterator:
+            pass
+
+    async def run():
+        await asyncio.gather(call(), call())
+
+    asyncio.run(run())
+
+    assert peak == 1

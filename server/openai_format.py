@@ -264,6 +264,7 @@ def stream_chunks(
     tools_enabled: bool = False,
     sources: bool = APPEND_SOURCES,
     result: Optional[Dict[str, Any]] = None,
+    tool_names: Optional[Iterable[str]] = None,
 ) -> Iterable[str]:
     """Yield OpenAI SSE frames for one completion."""
     from .toolbridge import ToolCallStream
@@ -285,7 +286,7 @@ def stream_chunks(
 
     yield frame({"role": "assistant", "content": ""})
 
-    splitter = ToolCallStream(enabled=tools_enabled)
+    splitter = ToolCallStream(enabled=tools_enabled, allowed_names=tool_names)
     collected_calls: List[ToolCall] = []
     answer_parts: List[str] = []
     reasoning_parts: List[str] = []
@@ -375,12 +376,18 @@ class Answer:
     state: Any
 
 
-def collect_answer(stream, *, tools_enabled: bool = False, sources: bool = APPEND_SOURCES) -> Answer:
+def collect_answer(
+    stream,
+    *,
+    tools_enabled: bool = False,
+    sources: bool = APPEND_SOURCES,
+    tool_names: Optional[Iterable[str]] = None,
+) -> Answer:
     """Consume a completion stream into a single answer (non-streaming path)."""
     from .toolbridge import ToolCallStream
     from deepseek.events import ReasoningDelta, TextDelta
 
-    splitter = ToolCallStream(enabled=tools_enabled)
+    splitter = ToolCallStream(enabled=tools_enabled, allowed_names=tool_names)
     text_parts: List[str] = []
     reasoning_parts: List[str] = []
     calls: List[ToolCall] = []

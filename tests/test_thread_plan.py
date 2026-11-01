@@ -111,6 +111,51 @@ def test_anchor_finds_the_thread_when_the_key_changes(tmp_path):
     assert plan.thread.key == "key-vieja"
 
 
+def test_anchor_fallback_is_rejected_when_profiles_differ(tmp_path):
+    store = make(tmp_path)
+    first = turn("hola", "buenas")
+    store.save(
+        key="key-vieja",
+        session_id="sess-vieja",
+        last_message_id=2,
+        messages_seen=first,
+        model_id="m",
+        anchor="anchor-x",
+        profile_hash="profile-a",
+    )
+
+    plan = store.plan(
+        "key-nueva",
+        first + [{"role": "user", "content": "sigo"}],
+        "anchor-x",
+        "profile-b",
+    )
+
+    assert plan.mode == "new"
+
+
+def test_thread_anchor_uses_the_first_two_messages():
+    from server.api import _thread_anchor
+
+    one = _thread_anchor([{"role": "user", "content": "hola"}])
+    two = _thread_anchor(
+        [
+            {"role": "user", "content": "hola"},
+            {"role": "assistant", "content": "buenas"},
+        ]
+    )
+    two_with_system = _thread_anchor(
+        [
+            {"role": "system", "content": "sos un asistente"},
+            {"role": "user", "content": "hola"},
+            {"role": "assistant", "content": "buenas"},
+        ]
+    )
+
+    assert one != two
+    assert two == two_with_system
+
+
 def test_edit_marker_truncates_and_appends_the_instruction():
     from server.api import _apply_edit_marker
 

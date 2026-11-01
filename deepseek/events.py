@@ -98,6 +98,8 @@ class StreamState:
     auto_resume: bool = False
     search_queries: List[str] = field(default_factory=list)
     search_results: List[Dict] = field(default_factory=list)
+    emitted_answer: str = ""
+    emitted_reasoning: str = ""
 
     def sorted_results(self) -> List[Dict]:
         """Search results ordered by their cite_index (the number in `[citation:N]`)."""

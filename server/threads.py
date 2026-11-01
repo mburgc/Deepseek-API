@@ -179,7 +179,11 @@ class ThreadStore:
         with self._lock:
             conn = self._connect()
             try:
-                row = self._row(conn, key) or self._row_by_anchor(conn, anchor or "")
+                row = self._row(conn, key)
+                found_by_anchor = False
+                if row is None:
+                    row = self._row_by_anchor(conn, anchor or "")
+                    found_by_anchor = row is not None
                 if row is None:
                     return Plan("new")
                 thread = _row_to_thread(row)
@@ -187,6 +191,15 @@ class ThreadStore:
                     conn.execute("DELETE FROM threads WHERE key = ?", (thread.key,))
                     conn.execute("DELETE FROM thread_messages WHERE thread_key = ?", (thread.key,))
                     conn.commit()
+                    return Plan("new")
+                if (
+                    found_by_anchor
+                    and thread.profile_hash
+                    and profile_hash
+                    and thread.profile_hash != profile_hash
+                ):
+                    # Same opening, different system prompt: almost certainly
+                    # another project/session, not a profile rewrite.
                     return Plan("new")
 
                 seen = self._seen(conn, thread.key)
