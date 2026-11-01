@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 
 import pytest
@@ -274,6 +275,55 @@ def test_readyz_reports_session(wired):
     response = client_http.get("/readyz")
     assert response.status_code == 200
     assert response.json()["status"] == "ready"
+
+
+class _LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_health_aliases_and_root(wired):
+    client_http, _ = wired([TextDelta("x")])
+
+    for path in ("/health", "/v1/health", "/healthz"):
+        assert client_http.get(path).status_code == 200, path
+    assert client_http.get("/").status_code == 200
+    assert client_http.get("/ready").status_code == 200
+
+
+def test_http_logging_records_the_404_path(wired):
+    client_http, _ = wired([TextDelta("x")])
+    capture = _LogCapture()
+    api._log.addHandler(capture)
+    try:
+        response = client_http.get("/nope")
+    finally:
+        api._log.removeHandler(capture)
+
+    assert response.status_code == 404
+    assert any("http GET /nope -> 404" in line for line in capture.messages)
+
+
+def test_chat_logs_model_and_thread(wired):
+    client_http, _ = wired([TextDelta("ok")])
+    capture = _LogCapture()
+    api._log.addHandler(capture)
+    try:
+        response = client_http.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    finally:
+        api._log.removeHandler(capture)
+
+    assert response.status_code == 200
+    assert any("chat model=deepseek-chat" in line for line in capture.messages)
+    assert any("mode=new" in line for line in capture.messages)
+    assert any("thread saved" in line for line in capture.messages)
 
 
 def test_serialized_endpoint_holds_the_lock_until_the_stream_finishes():

@@ -162,8 +162,9 @@ curl http://localhost:8000/v1/chat/completions \
 | `GET`  | `/v1/files/{id}/content` | Download the stored file |
 | `DELETE` | `/v1/files/{id}` | Forget a file locally |
 | `GET`  | `/v1/models` | Lists the available models |
-| `GET`  | `/healthz` | Liveness (rate-limit exempt) |
-| `GET`  | `/readyz` | Deep check: is the DeepSeek session usable? |
+| `GET`  | `/health`, `/healthz` | Liveness (rate-limit exempt) |
+| `GET`  | `/ready`, `/readyz` | Deep check: is the DeepSeek session usable? |
+| `GET`  | `/` | Service info and endpoint links |
 
 > Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
@@ -417,6 +418,18 @@ RATE_LIMIT_PER_MINUTE=60 python app.py   # raise it
 retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
 automatically and honours `Retry-After`; with plain HTTP, add a few retries
 yourself.
+
+## Logging
+
+The server prints one line per HTTP request (method, path, status, duration) and,
+for chat requests, the model, stream mode, thread plan (`new`/`append`/`branch`),
+tool names and the saved thread. It never logs message content or credentials.
+
+Set `LOG_LEVEL=DEBUG` to include health checks and other quiet endpoints:
+
+```bash
+LOG_LEVEL=DEBUG python app.py
+```
 
 ---
 

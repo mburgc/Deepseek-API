@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import re
 import threading
 import time
@@ -73,6 +74,23 @@ load_dotenv()
 
 _log = logging.getLogger("deepseek.bridge")
 
+
+def _configure_logging() -> None:
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    _log.setLevel(getattr(logging, level_name, logging.INFO))
+    _log.propagate = False
+    if not _log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%H:%M:%S")
+        )
+        _log.addHandler(handler)
+
+
+_configure_logging()
+
+_QUIET_PATHS = {"/", "/health", "/healthz", "/v1/health", "/ready", "/readyz"}
+
 ROOT = Path(__file__).resolve().parent.parent
 SESSION_DIR = ROOT / "session"
 MAX_MEDIA_BYTES = 25 * 1024 * 1024
@@ -107,6 +125,7 @@ def get_services() -> Services:
                 )
                 files = FileService(client, store_path=SESSION_DIR / "files.json")
                 _services = Services(client, threads, files)
+                _log.info("services ready; db=%s", threads.path)
     return _services
 
 
@@ -123,9 +142,11 @@ def _prewarm() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _log.info("bridge starting; db=%s", SESSION_DIR / "bridge.db")
     if SESSION_PREWARM:
         threading.Thread(target=_prewarm, name="prewarm", daemon=True).start()
     yield
+    _log.info("bridge stopping")
     if _services is not None:
         _services.close()
 
@@ -136,6 +157,31 @@ install_rate_limit(
     RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0),
     exempt_localhost=RATE_LIMIT_EXEMPT_LOCALHOST,
 )
+
+
+@app.middleware("http")
+async def _log_http(request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        _log.exception("http %s %s crashed", request.method, request.url.path)
+        raise
+
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    path = request.url.path
+    level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    if response.status_code < 400 and path in _QUIET_PATHS:
+        level = logging.DEBUG
+    _log.log(
+        level,
+        "http %s %s -> %s (%.0f ms)",
+        request.method,
+        path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 _upstream_lock = threading.Lock() if UPSTREAM_SERIALIZE else None
 
@@ -226,6 +272,7 @@ def _sse_error(exc: Exception) -> str:
 
 
 def _map_exception(exc: Exception) -> JSONResponse:
+    _log.warning("request failed (%s): %s", type(exc).__name__, exc)
     if isinstance(exc, LoginRequired):
         return _error(str(exc), 503, "login_required")
     if isinstance(exc, FileRejected):
@@ -247,6 +294,18 @@ def _map_exception(exc: Exception) -> JSONResponse:
     return _error(f"Internal bridge error: {exc}", 500, "server_error")
 
 
+@app.get("/")
+def root():
+    return {
+        "name": "DeepSeek Bridge",
+        "health": "/healthz",
+        "ready": "/readyz",
+        "models": "/v1/models",
+    }
+
+
+@app.get("/v1/health")
+@app.get("/health")
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
@@ -256,6 +315,7 @@ _ready_cache: Dict[str, Any] = {"at": 0.0, "payload": None, "status": 200}
 
 
 @app.get("/readyz")
+@app.get("/ready")
 async def readyz():
     if time.time() - _ready_cache["at"] < 30.0 and _ready_cache["payload"] is not None:
         return JSONResponse(status_code=_ready_cache["status"], content=_ready_cache["payload"])
@@ -558,6 +618,12 @@ def _remember_thread(
             keep_ids_before=send_from,
             last_response=json.dumps(assistant, ensure_ascii=False),
         )
+        _log.info(
+            "thread saved key=%s session=%s seen=%d",
+            key[:12],
+            str(stream.session_id)[:12],
+            len(messages) + 1,
+        )
     except Exception as exc:
         _log.warning("could not persist thread: %s", exc)
 
@@ -594,6 +660,13 @@ async def chat_completions(req: ChatCompletionRequest):
         for tool in (req.tools or [])
         if getattr(getattr(tool, "function", None), "name", None)
     ]
+    _log.info(
+        "chat model=%s stream=%s messages=%d tools=%d",
+        req.model,
+        req.stream,
+        len(messages),
+        len(tool_names),
+    )
 
     try:
         services = await run_in_threadpool(get_services)
@@ -606,9 +679,19 @@ async def chat_completions(req: ChatCompletionRequest):
     plan = None
     if req.conversation_id:
         slice_messages = tail_messages(messages)
+        _log.info("thread key=%s anchor=%s mode=conversation_id", key[:12], anchor[:12])
     else:
         plan = await run_in_threadpool(services.threads.plan, key, messages, anchor, profile)
         slice_messages = messages[plan.send_from:]
+        _log.info(
+            "thread key=%s anchor=%s mode=%s send_from=%s parent=%s session=%s",
+            key[:12],
+            anchor[:12],
+            plan.mode,
+            plan.send_from,
+            plan.parent_id,
+            plan.thread.session_id[:12] if plan.thread else "-",
+        )
 
     try:
         ref_ids, has_image = await run_in_threadpool(

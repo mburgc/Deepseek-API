@@ -9,6 +9,7 @@ is re-emitted as OpenAI frames (content, reasoning, tool_calls, citations).
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -18,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .config import APPEND_SOURCES, MAX_TOOL_RESULT_CHARS
 from .content import text_of
 from .toolbridge import ToolCall
+
+_log = logging.getLogger("deepseek.bridge")
 
 _ROLE_LABELS = {
     "system": "System",
@@ -323,6 +326,12 @@ def stream_chunks(
             yield frame({"content": suffix})
 
     if collected_calls:
+        _log.info(
+            "tool calls n=%d names=%s args=%s",
+            len(collected_calls),
+            [call.name for call in collected_calls],
+            [sorted(call.arguments) for call in collected_calls],
+        )
         delta_calls = []
         for index, call in enumerate(collected_calls):
             call_id = call.call_id or f"call_{uuid.uuid4().hex[:24]}"
@@ -405,6 +414,14 @@ def collect_answer(
         elif isinstance(event, ReasoningDelta):
             reasoning_parts.append(event.text)
     absorb(splitter.flush())
+
+    if calls:
+        _log.info(
+            "tool calls n=%d names=%s args=%s",
+            len(calls),
+            [call.name for call in calls],
+            [sorted(call.arguments) for call in calls],
+        )
 
     state = getattr(stream, "state", None)
     results = state.sorted_results() if state is not None else []
